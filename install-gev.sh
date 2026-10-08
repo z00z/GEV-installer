@@ -1,129 +1,308 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+# ============================================================
+# God's Eye View — Hostinger Traefik one-click installer
+# Fresh-VPS / fresh-install edition
+#
+# Supported Hostinger Traefik layouts:
+#   1) Traefik running with network_mode=host
+#   2) Hostinger's shared external "traefik-proxy" network
+#
+# Public access:
+#   HTTPS + Traefik BasicAuth
+#
+# God's Eye View:
+#   Official upstream source
+#   GEV itself binds ONLY to 127.0.0.1:4173
+#
+# POWER UP:
+#   Provider Settings remains usable remotely behind auth
+#   through a tightly-scoped loopback adapter.
+# ============================================================
+
 APP_ROOT="/opt/gods-eye-view"
 SRC_DIR="$APP_ROOT/app"
 STATE_DIR="$APP_ROOT/state"
+
 REPO="https://github.com/bilawalsidhu/gods-eye-view.git"
-TRAEFIK_NETWORK="traefik-proxy"
-CERT_RESOLVER="letsencrypt"
-NODE_IMAGE="node:24-bookworm-slim"
+GEV_REF="main"
+EXPECTED_GEV_VERSION="0.2.1"
+
+NODE_IMAGE="node:24.21.0-bookworm-slim"
 RUNTIME_IMAGE="gods-eye-view-hosted:local"
+
 APP_UID=1000
 APP_GID=1000
 
+CERT_RESOLVER="letsencrypt"
+SHARED_TRAEFIK_NETWORK="traefik-proxy"
+
 say()  { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
-warn() { printf '\n\033[1;33mWARNING: %s\033[0m\n' "$*"; }
+ok()   { printf '\n\033[1;32m==> %s\033[0m\n' "$*"; }
+warn() { printf '\n\033[1;33mWARNING: %s\033[0m\n' "$*" >&2; }
 die()  { printf '\n\033[1;31mERROR: %s\033[0m\n' "$*" >&2; exit 1; }
+
+cleanup_tmp() {
+  rm -f "${TMP_TRAEFIK_LIST:-}" 2>/dev/null || true
+}
+trap cleanup_tmp EXIT
 
 on_error() {
   local rc=$?
   printf '\n\033[1;31mInstaller stopped (exit %s).\033[0m\n' "$rc" >&2
+
   if [[ -d "$APP_ROOT" ]] && command -v docker >/dev/null 2>&1; then
-    (cd "$APP_ROOT" && docker compose ps 2>/dev/null) || true
-    (cd "$APP_ROOT" && docker compose logs --tail=120 2>/dev/null) || true
+    (
+      cd "$APP_ROOT"
+      docker compose ps 2>/dev/null || true
+      docker compose logs --tail=120 gods-eye-view 2>/dev/null || true
+    ) >&2
   fi
+
   exit "$rc"
 }
 trap on_error ERR
 
-[[ ${EUID:-$(id -u)} -eq 0 ]] || die "Run this as root."
-command -v docker >/dev/null 2>&1 || die "Docker is not installed. Start from Hostinger's Traefik/Docker template."
-docker compose version >/dev/null 2>&1 || die "Docker Compose v2 is not available."
 
-if ! docker network inspect "$TRAEFIK_NETWORK" >/dev/null 2>&1; then
-  die "The Docker network '$TRAEFIK_NETWORK' does not exist. Deploy/start Hostinger's Traefik template first, then rerun this installer."
+# ============================================================
+# ROOT / FRESH-INSTALL GUARDS
+# ============================================================
+
+[[ ${EUID:-$(id -u)} -eq 0 ]] ||
+  die "Run this installer as root."
+
+command -v docker >/dev/null 2>&1 ||
+  die "Docker is not installed. Start from Hostinger's Docker/Traefik VPS image."
+
+docker compose version >/dev/null 2>&1 ||
+  die "Docker Compose v2 is not available."
+
+if [[ -e "$APP_ROOT/docker-compose.yml" ||
+      -e "$APP_ROOT/app" ||
+      -e "$APP_ROOT/.public-host" ]]
+then
+  die "An existing God's Eye View installation was found at:
+
+$APP_ROOT
+
+This public installer is intentionally fresh-install only.
+Use a new VPS, or remove the old installation yourself after backing up any .env/API keys."
 fi
 
-if ! docker ps --format '{{.Names}} {{.Image}}' | grep -qi traefik; then
-  warn "The '$TRAEFIK_NETWORK' network exists, but I could not confirm a running Traefik container. Installation can continue, but the public URL will not work until Traefik is running."
-fi
+
+# ============================================================
+# MINIMAL HOST PREREQUISITES
+# ============================================================
 
 say "Installing prerequisites"
+
 export DEBIAN_FRONTEND=noninteractive
+
 apt-get update -qq
-apt-get install -y -qq git ca-certificates curl apache2-utils nano iproute2 >/dev/null
+apt-get install -y -qq \
+  git \
+  ca-certificates \
+  curl \
+  apache2-utils \
+  nano \
+  iproute2 \
+  >/dev/null
 
-printf '\nGod\x27s Eye View — authenticated remote deployment\n'
-printf '%s\n' '------------------------------------------------'
 
-# Hostinger assigns Docker apps temporary HTTPS hostnames beneath the VPS host,
-# e.g. app-ab12.srv123456.hstgr.cloud. Prefer that zero-DNS-setup path.
-# A custom hostname can still be supplied non-interactively with GEV_DOMAIN.
-HOSTINGER_HOST_FILE="$APP_ROOT/.public-host"
-HOSTINGER_BASE_FILE="$APP_ROOT/.hostinger-base-host"
-PROJECT_SLUG_FILE="$APP_ROOT/.project-slug"
+# ============================================================
+# TRAEFIK DETECTION
+#
+# We support the two Hostinger layouts seen/documented:
+#
+# A) Host-network Traefik:
+#      Traefik itself is network_mode=host and can reach Docker
+#      bridge-container IPs directly.
+#
+# B) Shared bridge:
+#      Traefik joins external network "traefik-proxy"; this app
+#      joins the same network and labels it explicitly.
+# ============================================================
+
+say "Detecting the Hostinger Traefik deployment"
+
+TMP_TRAEFIK_LIST="$(mktemp)"
+: > "$TMP_TRAEFIK_LIST"
+
+while IFS= read -r cid; do
+  [[ -n "$cid" ]] || continue
+
+  image="$(
+    docker inspect "$cid" \
+      --format '{{.Config.Image}}' \
+      2>/dev/null || true
+  )"
+
+  image_lc="${image,,}"
+
+  [[ "$image_lc" == *traefik* ]] || continue
+
+  socket_mount="$(
+    docker inspect "$cid" \
+      --format '{{range .Mounts}}{{if eq .Destination "/var/run/docker.sock"}}yes{{end}}{{end}}' \
+      2>/dev/null || true
+  )"
+
+  [[ "$socket_mount" == "yes" ]] || continue
+
+  name="$(
+    docker inspect "$cid" \
+      --format '{{.Name}}' \
+      2>/dev/null | sed 's#^/##' || true
+  )"
+
+  network_mode="$(
+    docker inspect "$cid" \
+      --format '{{.HostConfig.NetworkMode}}' \
+      2>/dev/null || true
+  )"
+
+  networks="$(
+    docker inspect "$cid" \
+      --format '{{range $name, $cfg := .NetworkSettings.Networks}}{{println $name}}{{end}}' \
+      2>/dev/null || true
+  )"
+
+  if [[ "$network_mode" == "host" ]]; then
+    printf '%s|%s|host|\n' "$cid" "$name" >> "$TMP_TRAEFIK_LIST"
+    continue
+  fi
+
+  if grep -Fxq "$SHARED_TRAEFIK_NETWORK" <<<"$networks"; then
+    printf '%s|%s|shared|%s\n' \
+      "$cid" "$name" "$SHARED_TRAEFIK_NETWORK" \
+      >> "$TMP_TRAEFIK_LIST"
+    continue
+  fi
+
+done < <(
+  docker ps \
+    --filter status=running \
+    --format '{{.ID}}'
+)
+
+TRAEFIK_COUNT="$(wc -l < "$TMP_TRAEFIK_LIST" | tr -d ' ')"
+
+(( TRAEFIK_COUNT >= 1 )) ||
+  die "No compatible running Hostinger Traefik container was found.
+
+Expected either:
+  • a running Traefik container using host networking, or
+  • a running Traefik container attached to the external '$SHARED_TRAEFIK_NETWORK' network,
+
+with /var/run/docker.sock mounted.
+
+Deploy/start Hostinger's Traefik template first."
+
+if (( TRAEFIK_COUNT > 1 )); then
+  printf '\nCompatible Traefik containers found:\n' >&2
+  awk -F'|' '{printf "  - %s (%s)\n", $2, $3}' "$TMP_TRAEFIK_LIST" >&2
+
+  die "More than one compatible Traefik instance is running.
+
+A fresh Hostinger VPS should have one active Traefik instance.
+Remove/stop duplicate Traefik projects and run the installer again."
+fi
+
+IFS='|' read -r TRAEFIK_CID TRAEFIK_CONTAINER TRAEFIK_MODE TRAEFIK_NETWORK \
+  < "$TMP_TRAEFIK_LIST"
+
+[[ -n "$TRAEFIK_CONTAINER" ]] ||
+  die "Could not identify the active Traefik container."
+
+if [[ "$TRAEFIK_MODE" == "shared" ]]; then
+  docker network inspect "$TRAEFIK_NETWORK" >/dev/null 2>&1 ||
+    die "Traefik reports the shared network '$TRAEFIK_NETWORK', but Docker cannot inspect it."
+fi
+
+TRAEFIK_CMD="$(
+  docker inspect "$TRAEFIK_CID" \
+    --format '{{range .Config.Cmd}}{{println .}}{{end}}' \
+    2>/dev/null || true
+)"
+
+# These are the Hostinger conventions our labels rely on.
+if [[ -n "$TRAEFIK_CMD" ]]; then
+  if grep -q -- '--providers.docker.exposedbydefault=true' <<<"$TRAEFIK_CMD"; then
+    warn "Traefik has exposedByDefault=true. The GEV service still declares traefik.enable=true and is protected by BasicAuth, but this is less strict than Hostinger's normal template."
+  fi
+fi
+
+ok "Traefik detected: $TRAEFIK_CONTAINER ($TRAEFIK_MODE mode)"
+
+
+# ============================================================
+# HOSTINGER HOSTNAME
+# ============================================================
 
 normalize_host() {
   local value="${1:-}"
+
   value="${value,,}"
   value="${value#http://}"
   value="${value#https://}"
   value="${value%%/*}"
   value="${value%.}"
+
   printf '%s' "$value"
 }
 
 valid_hostname() {
   local value="${1:-}"
+
   (( ${#value} <= 253 )) || return 1
+
   [[ "$value" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$ ]]
 }
 
 detect_hostinger_base() {
   local candidate=""
 
-  # Preserve the base selected on the first successful run.
-  if [[ -s "$HOSTINGER_BASE_FILE" ]]; then
-    candidate="$(normalize_host "$(cat "$HOSTINGER_BASE_FILE" 2>/dev/null || true)")"
-    if [[ "$candidate" =~ ^srv[0-9]+\.hstgr\.cloud$ ]]; then
-      printf '%s' "$candidate"
-      return 0
-    fi
-  fi
-
-  # If the current shell/project already exposes Hostinger's TRAEFIK_HOST,
-  # prefer it before probing the OS hostname.
   candidate="$(normalize_host "${TRAEFIK_HOST:-}")"
   if [[ "$candidate" =~ ^srv[0-9]+\.hstgr\.cloud$ ]]; then
     printf '%s' "$candidate"
     return 0
   fi
 
-  # Hostinger normally sets the VPS hostname itself to srvNNNNNN.hstgr.cloud.
   for candidate in \
     "$(hostname -f 2>/dev/null || true)" \
     "$(hostname 2>/dev/null || true)" \
     "$(cat /etc/hostname 2>/dev/null || true)"
   do
     candidate="$(normalize_host "$candidate")"
+
     if [[ "$candidate" =~ ^srv[0-9]+\.hstgr\.cloud$ ]]; then
       printf '%s' "$candidate"
       return 0
     fi
   done
 
-  # Catalog projects commonly keep TRAEFIK_HOST in /docker/<project>/.env.
   if [[ -d /docker ]]; then
     while IFS= read -r candidate; do
       candidate="$(normalize_host "$candidate")"
+
       if [[ "$candidate" =~ ^srv[0-9]+\.hstgr\.cloud$ ]]; then
         printf '%s' "$candidate"
         return 0
       fi
     done < <(
       grep -RhsE '^[[:space:]]*TRAEFIK_HOST=' \
-        /docker/*/.env /docker/*/*/.env 2>/dev/null \
+        /docker/*/.env \
+        /docker/*/*/.env \
+        2>/dev/null \
         | sed -E 's/^[[:space:]]*TRAEFIK_HOST[[:space:]]*=[[:space:]]*//' \
         | tr -d '"\047' \
         || true
     )
   fi
 
-  # Last resort: discover an hstgr.cloud VPS base from running container
-  # environments/Traefik Host rules, useful if the OS hostname was customized.
   candidate="$(
-    docker inspect $(docker ps -aq 2>/dev/null) 2>/dev/null \
+    docker inspect "$TRAEFIK_CID" 2>/dev/null \
       | grep -oE 'srv[0-9]+\.hstgr\.cloud' \
       | head -n1 \
       || true
@@ -140,79 +319,99 @@ detect_hostinger_base() {
 }
 
 if [[ -n "${GEV_DOMAIN:-}" ]]; then
-
   DOMAIN="$(normalize_host "$GEV_DOMAIN")"
-  valid_hostname "$DOMAIN" || die "GEV_DOMAIN is not a valid hostname: $DOMAIN"
-  HOST_MODE="custom override (GEV_DOMAIN)"
 
-elif [[ -s "$HOSTINGER_HOST_FILE" ]]; then
+  valid_hostname "$DOMAIN" ||
+    die "GEV_DOMAIN is not a valid hostname: $DOMAIN"
 
-  DOMAIN="$(normalize_host "$(cat "$HOSTINGER_HOST_FILE")")"
-  valid_hostname "$DOMAIN" || die "Saved public hostname is invalid: $DOMAIN"
-
-  if [[ "$DOMAIN" == *.hstgr.cloud ]]; then
-    HOST_MODE="saved Hostinger-managed hostname"
-  else
-    HOST_MODE="saved custom hostname"
-  fi
+  HOST_MODE="custom domain"
 
 else
+  BASE_HOST="$(detect_hostinger_base || true)"
 
-  HOSTINGER_BASE="$(detect_hostinger_base || true)"
+  [[ -n "$BASE_HOST" ]] ||
+    die "Could not detect the Hostinger VPS hostname (expected srvNNNNNN.hstgr.cloud).
 
-  [[ -n "$HOSTINGER_BASE" ]] || die \
-    "Could not auto-detect this VPS's Hostinger hostname (expected srvNNNNNN.hstgr.cloud).
+If you intentionally changed the VPS hostname, run with a domain you control:
 
-If you intentionally use a custom domain, rerun as:
+GEV_DOMAIN=gev.example.com bash install-gev.sh"
 
-GEV_DOMAIN=gev.example.com bash <installer>"
+  RANDOM_SUFFIX="$(
+    od -An -N4 -tx1 /dev/urandom \
+      | tr -d ' \n'
+  )"
 
-  if [[ -s "$PROJECT_SLUG_FILE" ]]; then
+  [[ "$RANDOM_SUFFIX" =~ ^[0-9a-f]{8}$ ]] ||
+    die "Could not generate the Hostinger hostname suffix."
 
-    PROJECT_SLUG="$(cat "$PROJECT_SLUG_FILE" 2>/dev/null || true)"
+  DOMAIN="gev-${RANDOM_SUFFIX}.${BASE_HOST}"
 
-  else
-
-    PROJECT_SLUG="gods-eye-view-$(
-      od -An -N4 -tx1 /dev/urandom | tr -d ' \n'
-    )"
-
-  fi
-
-  [[ "$PROJECT_SLUG" =~ ^[a-z0-9][a-z0-9-]{2,62}$ ]] || \
-    die "Generated/saved project slug is invalid: $PROJECT_SLUG"
-
-  DOMAIN="${PROJECT_SLUG}.${HOSTINGER_BASE}"
-
-  valid_hostname "$DOMAIN" || \
+  valid_hostname "$DOMAIN" ||
     die "Generated Hostinger hostname is invalid: $DOMAIN"
 
-  printf '%s\n' "$HOSTINGER_BASE" > "$HOSTINGER_BASE_FILE"
-  printf '%s\n' "$PROJECT_SLUG" > "$PROJECT_SLUG_FILE"
-  printf '%s\n' "$DOMAIN" > "$HOSTINGER_HOST_FILE"
-
-  chmod 600 \
-    "$HOSTINGER_BASE_FILE" \
-    "$PROJECT_SLUG_FILE" \
-    "$HOSTINGER_HOST_FILE"
-
-  HOST_MODE="Hostinger-managed temporary hostname"
-
+  HOST_MODE="Hostinger wildcard hostname"
 fi
 
-# Keep the selected hostname stable across reruns, including a GEV_DOMAIN
-# override, so the same BasicAuth/Origin policy continues to match.
-printf '%s\n' "$DOMAIN" > "$HOSTINGER_HOST_FILE"
-chmod 600 "$HOSTINGER_HOST_FILE"
+mkdir -p "$APP_ROOT"
+chmod 700 "$APP_ROOT"
 
-say "Using public hostname: $DOMAIN ($HOST_MODE)"
+printf '%s\n' "$DOMAIN" > "$APP_ROOT/.public-host"
+chmod 600 "$APP_ROOT/.public-host"
 
-# Unique Traefik object names avoid collisions with another GEV deployment.
-ROUTER_SUFFIX="$(printf '%s' "$DOMAIN" | sha256sum | cut -c1-10)"
-ROUTER_ID="gev-${ROUTER_SUFFIX}"
+say "Checking public DNS / Hostinger wildcard routing"
+
+DNS_OK=0
+
+for _ in $(seq 1 12); do
+  if getent ahostsv4 "$DOMAIN" >/dev/null 2>&1; then
+    DNS_OK=1
+    break
+  fi
+
+  sleep 5
+done
+
+(( DNS_OK == 1 )) ||
+  die "The public hostname does not resolve:
+
+$DOMAIN
+
+For a custom GEV_DOMAIN, create its DNS record first.
+For a Hostinger hostname, verify the VPS hostname/wildcard DNS is active."
+
+# Before our router exists, a reachable Traefik normally returns a redirect
+# or a not-found response. The exact status is not important; a real HTTP
+# response proves DNS reaches the VPS edge instead of timing out.
+HTTP_PRECHECK="$(
+  curl \
+    -sS \
+    --connect-timeout 8 \
+    --max-time 20 \
+    -o /dev/null \
+    -w '%{http_code}' \
+    "http://${DOMAIN}/" \
+    2>/dev/null \
+    || true
+)"
+
+[[ "$HTTP_PRECHECK" =~ ^[1-5][0-9][0-9]$ ]] ||
+  die "DNS resolves, but HTTP traffic did not reach a web server for:
+
+http://${DOMAIN}/
+
+Check Hostinger networking/firewall and the Traefik project before continuing."
+
+ok "Public hostname is reachable: $DOMAIN"
+
+
+# ============================================================
+# LOGIN CREDENTIALS
+# ============================================================
+
+printf '\nGod\x27s Eye View — secure Hostinger deployment\n'
+printf '%s\n' '---------------------------------------------'
 
 while :; do
-
   printf 'Login username [admin]: ' >/dev/tty
   IFS= read -r AUTH_USER </dev/tty
 
@@ -221,17 +420,14 @@ while :; do
   [[ "$AUTH_USER" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] && break
 
   printf 'Use 1-64 letters, numbers, dots, underscores or hyphens.\n' >/dev/tty
-
 done
 
 while :; do
-
   printf 'Login password (12-64 bytes): ' >/dev/tty
   IFS= read -rs AUTH_PASS </dev/tty
 
   printf '\nConfirm password: ' >/dev/tty
   IFS= read -rs AUTH_CONFIRM </dev/tty
-
   printf '\n' >/dev/tty
 
   if [[ "$AUTH_PASS" != "$AUTH_CONFIRM" ]]; then
@@ -239,156 +435,108 @@ while :; do
     continue
   fi
 
-  PASS_BYTES="$(printf '%s' "$AUTH_PASS" | wc -c | tr -d ' ')"
+  PASS_BYTES="$(
+    printf '%s' "$AUTH_PASS" \
+      | wc -c \
+      | tr -d ' '
+  )"
 
-  if (( PASS_BYTES < 12 )); then
-    printf 'Please use at least 12 bytes.\n' >/dev/tty
-    continue
-  fi
-
-  if (( PASS_BYTES > 64 )); then
-    printf 'Please use no more than 64 bytes (avoids bcrypt truncation).\n' >/dev/tty
+  if (( PASS_BYTES < 12 || PASS_BYTES > 64 )); then
+    printf 'Use a password between 12 and 64 bytes.\n' >/dev/tty
     continue
   fi
 
   break
-
 done
 
-# Read the password from stdin so plaintext never appears in htpasswd argv.
 AUTH_PAIR="$(
-  printf '%s\n' "$AUTH_PASS" |
-    htpasswd -niB -C 10 "$AUTH_USER"
+  printf '%s\n' "$AUTH_PASS" \
+    | htpasswd -niB -C 10 "$AUTH_USER"
 )"
 
-# Docker Compose treats $$ as a literal $ in label values.
 AUTH_ESCAPED="$(
-  printf '%s' "$AUTH_PAIR" |
-    sed 's/\$/\$\$/g'
+  printf '%s' "$AUTH_PAIR" \
+    | sed 's/\$/\$\$/g'
 )"
 
-say "Preparing the official God's Eye View source"
+ROUTER_SUFFIX="$(
+  printf '%s' "$DOMAIN" \
+    | sha256sum \
+    | cut -c1-10
+)"
+
+ROUTER_ID="gev-${ROUTER_SUFFIX}"
+
+
+# ============================================================
+# OFFICIAL GEV SOURCE
+# ============================================================
+
+say "Resolving and cloning official God's Eye View source"
+
+RESOLVED_GEV_SHA="$(
+  git ls-remote "$REPO" "refs/heads/${GEV_REF}" \
+    | awk 'NR==1{print $1}'
+)"
+
+[[ "$RESOLVED_GEV_SHA" =~ ^[0-9a-f]{40}$ ]] ||
+  die "Could not resolve the official God's Eye View ${GEV_REF} revision."
 
 mkdir -p \
-  "$APP_ROOT" \
   "$STATE_DIR/cache" \
   "$STATE_DIR/logs"
 
-chmod 700 \
-  "$APP_ROOT" \
-  "$STATE_DIR" \
-  "$STATE_DIR/cache" \
-  "$STATE_DIR/logs"
+git clone \
+  --depth=1 \
+  --branch "$GEV_REF" \
+  "$REPO" \
+  "$SRC_DIR"
 
-if [[ -d "$SRC_DIR/.git" ]]; then
+[[ -f "$SRC_DIR/package.json" ]] ||
+  die "GEV checkout is missing package.json."
 
-  git -c safe.directory="$SRC_DIR" \
-    -C "$SRC_DIR" remote set-url origin "$REPO"
+[[ -f "$SRC_DIR/package-lock.json" ]] ||
+  die "GEV checkout is missing package-lock.json."
 
-  git -c safe.directory="$SRC_DIR" \
-    -C "$SRC_DIR" fetch --depth=1 origin main
+[[ -f "$SRC_DIR/.env.example" ]] ||
+  die "GEV checkout is missing .env.example."
 
-  # Preflight TARGET revision before touching the running checkout.
-  PREFLIGHT_DIR="$(mktemp -d)"
+[[ -f "$SRC_DIR/src/keySetupCore.mjs" ]] ||
+  die "GEV checkout is missing src/keySetupCore.mjs."
 
-  trap 'rm -rf "${PREFLIGHT_DIR:-}"' EXIT
+[[ -f "$SRC_DIR/src/localRequestGate.mjs" ]] ||
+  die "GEV checkout is missing src/localRequestGate.mjs."
 
-  git -c safe.directory="$SRC_DIR" \
+UPSTREAM_COMMIT="$(
+  git \
+    -c safe.directory="$SRC_DIR" \
     -C "$SRC_DIR" \
-    show origin/main:src/localRequestGate.mjs \
-    > "$PREFLIGHT_DIR/localRequestGate.mjs" || \
-      die "Upstream target is missing src/localRequestGate.mjs. Existing instance was left untouched."
+    rev-parse HEAD
+)"
 
-  git -c safe.directory="$SRC_DIR" \
-    -C "$SRC_DIR" \
-    show origin/main:src/keySetupCore.mjs \
-    > "$PREFLIGHT_DIR/keySetupCore.mjs" || \
-      die "Upstream target is missing src/keySetupCore.mjs. Existing instance was left untouched."
+[[ "$UPSTREAM_COMMIT" == "$RESOLVED_GEV_SHA" ]] ||
+  die "God's Eye View main changed while the installer was cloning it.
 
-  EXPECTED_PROXY_SIGNALS="cf-connecting-ip cf-ray forwarded via x-forwarded-for x-forwarded-host x-forwarded-port x-forwarded-proto x-real-ip"
+Resolved first: $RESOLVED_GEV_SHA
+Cloned:         $UPSTREAM_COMMIT
 
-  TARGET_PROXY_SIGNALS="$(
-    sed -n \
-      '/PROXY_SIGNALS = Object.freeze(\[/,/\]);/p' \
-      "$PREFLIGHT_DIR/localRequestGate.mjs" \
-      | grep -oE "'[^']+'" \
-      | tr -d "'" \
-      | sort \
-      | xargs \
-      || true
-  )"
+Run the installer again so one exact upstream revision is validated end-to-end."
 
-  [[ "$TARGET_PROXY_SIGNALS" == "$EXPECTED_PROXY_SIGNALS" ]] || \
-    die "Upstream target proxy-signal policy changed. Existing instance was left untouched; review this installer before updating."
+UPSTREAM_VERSION="$(
+  sed -nE \
+    's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' \
+    "$SRC_DIR/package.json" \
+    | head -n1
+)"
 
-  grep -Fq "LOOPBACK_ADDRESSES" \
-    "$PREFLIGHT_DIR/keySetupCore.mjs" || \
-      die "Upstream target Provider Settings loopback policy changed. Existing instance was left untouched."
+[[ "$UPSTREAM_VERSION" == "$EXPECTED_GEV_VERSION" ]] ||
+  die "This installer was audited for God's Eye View $EXPECTED_GEV_VERSION.
 
-  grep -Fq \
-    "Provider Settings answers only local hostnames" \
-    "$PREFLIGHT_DIR/keySetupCore.mjs" || \
-      die "Upstream target Provider Settings Host policy changed. Existing instance was left untouched."
+The cloned source reports version:
 
-  grep -Fq \
-    "Provider Settings requires an exact local Origin" \
-    "$PREFLIGHT_DIR/keySetupCore.mjs" || \
-      die "Upstream target Provider Settings Origin policy changed. Existing instance was left untouched."
+${UPSTREAM_VERSION:-unknown}
 
-  rm -rf "$PREFLIGHT_DIR"
-  trap - EXIT
-
-  unset \
-    PREFLIGHT_DIR \
-    TARGET_PROXY_SIGNALS \
-    EXPECTED_PROXY_SIGNALS
-
-  if [[ -f "$APP_ROOT/docker-compose.yml" ]]; then
-
-    say "Stopping the existing God's Eye View runtime before updating source"
-
-    (
-      cd "$APP_ROOT"
-      docker compose stop gods-eye-view >/dev/null 2>&1
-    ) || warn "Could not cleanly stop the previous GEV runtime; continuing with source refresh."
-
-  fi
-
-  git -c safe.directory="$SRC_DIR" \
-    -C "$SRC_DIR" reset --hard HEAD >/dev/null
-
-  git -c safe.directory="$SRC_DIR" \
-    -C "$SRC_DIR" checkout -q -B main origin/main
-
-  git -c safe.directory="$SRC_DIR" \
-    -C "$SRC_DIR" reset --hard origin/main >/dev/null
-
-else
-
-  rm -rf "$SRC_DIR"
-
-  git clone \
-    --depth=1 \
-    --branch main \
-    "$REPO" \
-    "$SRC_DIR"
-
-fi
-
-[[ -f "$SRC_DIR/package.json" ]] || \
-  die "Upstream checkout is missing package.json."
-
-[[ -f "$SRC_DIR/package-lock.json" ]] || \
-  die "Upstream checkout is missing package-lock.json."
-
-[[ -f "$SRC_DIR/.env.example" ]] || \
-  die "Upstream checkout is missing .env.example."
-
-[[ -f "$SRC_DIR/src/keySetupCore.mjs" ]] || \
-  die "Upstream checkout is missing Provider Settings core."
-
-[[ -f "$SRC_DIR/src/localRequestGate.mjs" ]] || \
-  die "Upstream checkout is missing local request gate."
+The installer has stopped before deployment so a newer upstream security/runtime change is not silently exposed."
 
 EXPECTED_PROXY_SIGNALS="cf-connecting-ip cf-ray forwarded via x-forwarded-for x-forwarded-host x-forwarded-port x-forwarded-proto x-real-ip"
 
@@ -403,32 +551,49 @@ ACTUAL_PROXY_SIGNALS="$(
     || true
 )"
 
-[[ "$ACTUAL_PROXY_SIGNALS" == "$EXPECTED_PROXY_SIGNALS" ]] || \
-  die "Upstream proxy-signal policy changed. Expected: $EXPECTED_PROXY_SIGNALS ; found: ${ACTUAL_PROXY_SIGNALS:-none}. Review the installer before deploying this newer GEV revision."
+[[ "$ACTUAL_PROXY_SIGNALS" == "$EXPECTED_PROXY_SIGNALS" ]] ||
+  die "GEV's reverse-proxy security policy has changed.
 
-unset ACTUAL_PROXY_SIGNALS EXPECTED_PROXY_SIGNALS
+Expected:
+$EXPECTED_PROXY_SIGNALS
 
-grep -Fq \
-  "LOOPBACK_ADDRESSES" \
-  "$SRC_DIR/src/keySetupCore.mjs" || \
-    die "Upstream Provider Settings loopback policy changed. Review required."
+Found:
+${ACTUAL_PROXY_SIGNALS:-none}
 
-grep -Fq \
-  "Provider Settings answers only local hostnames" \
-  "$SRC_DIR/src/keySetupCore.mjs" || \
-    die "Upstream Provider Settings Host policy changed. Review required."
+The installer stopped rather than bypassing an unaudited security policy."
 
-grep -Fq \
-  "Provider Settings requires an exact local Origin" \
-  "$SRC_DIR/src/keySetupCore.mjs" || \
-    die "Upstream Provider Settings Origin policy changed. Review required."
+grep -Fq 'LOOPBACK_ADDRESSES' "$SRC_DIR/src/keySetupCore.mjs" ||
+  die "GEV Provider Settings loopback policy changed."
 
-# Provider Settings atomically writes .env in the repo root, therefore the
-# unprivileged application user must own the source directory.
-chown -R \
-  "$APP_UID:$APP_GID" \
-  "$SRC_DIR" \
-  "$STATE_DIR"
+grep -Fq 'Provider Settings answers only local hostnames' "$SRC_DIR/src/keySetupCore.mjs" ||
+  die "GEV Provider Settings Host policy changed."
+
+grep -Fq 'Provider Settings requires an exact local Origin' "$SRC_DIR/src/keySetupCore.mjs" ||
+  die "GEV Provider Settings Origin policy changed."
+
+grep -Fq "clientExposed: true" "$SRC_DIR/src/keySetupCore.mjs" ||
+  die "GEV Provider Settings registry shape changed unexpectedly."
+
+ok "GEV compatibility contract matches audited version $EXPECTED_GEV_VERSION"
+
+
+# ============================================================
+# GEV CONFIG
+# ============================================================
+
+cp "$SRC_DIR/.env.example" "$SRC_DIR/.env"
+
+# OpenSky "auto" gives keyless anonymous service now and automatically uses
+# OAuth later if the user enters credentials in POWER UP.
+if grep -Eq '^[[:space:]]*OPENSKY_AUTH_MODE=' "$SRC_DIR/.env"; then
+  sed -i -E \
+    's/^[[:space:]]*OPENSKY_AUTH_MODE=.*/OPENSKY_AUTH_MODE=auto/' \
+    "$SRC_DIR/.env"
+else
+  printf '\nOPENSKY_AUTH_MODE=auto\n' >> "$SRC_DIR/.env"
+fi
+
+chown -R "$APP_UID:$APP_GID" "$SRC_DIR" "$STATE_DIR"
 
 chmod 700 \
   "$SRC_DIR" \
@@ -436,127 +601,25 @@ chmod 700 \
   "$STATE_DIR/cache" \
   "$STATE_DIR/logs"
 
-FRESH_ENV=0
-
-if [[ ! -f "$SRC_DIR/.env" ]]; then
-
-  cp "$SRC_DIR/.env.example" "$SRC_DIR/.env"
-  FRESH_ENV=1
-
-else
-
-  while IFS= read -r line || [[ -n "$line" ]]; do
-
-    if [[ "$line" =~ ^[[:space:]]*#?[[:space:]]*([A-Z][A-Z0-9_]*)=(.*)$ ]]; then
-
-      key="${BASH_REMATCH[1]}"
-
-      if ! grep -Eq \
-        "^[[:space:]]*#?[[:space:]]*${key}=" \
-        "$SRC_DIR/.env"
-      then
-        printf \
-          '\n# Added from newer upstream .env.example\n%s\n' \
-          "$line" \
-          >> "$SRC_DIR/.env"
-      fi
-
-    fi
-
-  done < "$SRC_DIR/.env.example"
-
-fi
-
-# OpenSky's upstream template defaults to oauth.
-# For this hosted install auto is preferable:
-# OAuth is used if configured, otherwise anonymous mode works.
-CURRENT_OPENSKY_MODE="$(
-  grep -E \
-    '^[[:space:]]*OPENSKY_AUTH_MODE=' \
-    "$SRC_DIR/.env" 2>/dev/null \
-    | tail -n1 \
-    | sed -E 's/^[^=]*=//' \
-    | tr -d '"' \
-    | tr -d "'" \
-    | xargs \
-    || true
-)"
-
-OPENSKY_ID="$(
-  grep -E \
-    '^[[:space:]]*OPENSKY_CLIENT_ID=' \
-    "$SRC_DIR/.env" 2>/dev/null \
-    | tail -n1 \
-    | sed -E 's/^[^=]*=//' \
-    | tr -d '"' \
-    | tr -d "'" \
-    | xargs \
-    || true
-)"
-
-OPENSKY_SECRET="$(
-  grep -E \
-    '^[[:space:]]*OPENSKY_CLIENT_SECRET=' \
-    "$SRC_DIR/.env" 2>/dev/null \
-    | tail -n1 \
-    | sed -E 's/^[^=]*=//' \
-    | tr -d '"' \
-    | tr -d "'" \
-    | xargs \
-    || true
-)"
-
-if (( FRESH_ENV == 1 )) || {
-  [[ "$CURRENT_OPENSKY_MODE" == "oauth" ]] &&
-  [[ -z "$OPENSKY_ID" && -z "$OPENSKY_SECRET" ]]
-}; then
-
-  if grep -Eq \
-    '^[[:space:]]*OPENSKY_AUTH_MODE=' \
-    "$SRC_DIR/.env"
-  then
-
-    sed -i -E \
-      's/^[[:space:]]*OPENSKY_AUTH_MODE=.*/OPENSKY_AUTH_MODE=auto/' \
-      "$SRC_DIR/.env"
-
-  else
-
-    printf '\nOPENSKY_AUTH_MODE=auto\n' >> "$SRC_DIR/.env"
-
-  fi
-
-fi
-
-unset \
-  CURRENT_OPENSKY_MODE \
-  OPENSKY_ID \
-  OPENSKY_SECRET
-
 chmod 600 "$SRC_DIR/.env"
-chown "$APP_UID:$APP_GID" "$SRC_DIR/.env"
 
-UPSTREAM_COMMIT="$(
-  git -c safe.directory="$SRC_DIR" \
-    -C "$SRC_DIR" \
-    rev-parse --short=12 HEAD
-)"
 
-UPSTREAM_VERSION="$(
-  grep -m1 '"version"' "$SRC_DIR/package.json" \
-    | sed -E \
-      's/.*"version"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/' \
-    || true
-)"
+# ============================================================
+# PRIVATE EDGE TOKEN
+# ============================================================
 
-# Per-install internal token proving the request traversed our Traefik route.
 EDGE_TOKEN="$(
-  od -An -N32 -tx1 /dev/urandom |
-    tr -d ' \n'
+  od -An -N32 -tx1 /dev/urandom \
+    | tr -d ' \n'
 )"
 
-[[ "$EDGE_TOKEN" =~ ^[0-9a-f]{64}$ ]] || \
-  die "Could not generate the internal edge token."
+[[ "$EDGE_TOKEN" =~ ^[0-9a-f]{64}$ ]] ||
+  die "Could not generate the private Traefik edge token."
+
+
+# ============================================================
+# NGINX LOOPBACK ADAPTER
+# ============================================================
 
 cat > "$APP_ROOT/nginx.conf" <<'EOF'
 pid /tmp/gev-nginx/nginx.pid;
@@ -567,10 +630,8 @@ events {}
 http {
   access_log off;
 
-  # Hostinger's generated hostname can be long enough to exceed nginx's
-  # small default hash buckets. Explicit sizing avoids startup failures.
-  map_hash_bucket_size 128;
-  server_names_hash_bucket_size 128;
+  map_hash_bucket_size 512;
+  server_names_hash_bucket_size 512;
 
   client_body_temp_path /tmp/gev-nginx/client_body;
   proxy_temp_path /tmp/gev-nginx/proxy;
@@ -580,20 +641,22 @@ http {
 
   map $http_upgrade $connection_upgrade {
     default upgrade;
-    ''      close;
+    '' close;
   }
 
-  # Normal public application requests arrive over HTTPS at Traefik,
-  # but Vite itself receives HTTP locally. Translate only OUR exact public
-  # Origin so GEV's same-origin checks still work.
+  # Browsers see HTTPS at Traefik; GEV sees local HTTP.
+  # Translate only our exact public Origin so normal same-origin
+  # provider routes continue to pass GEV's own gate.
   map $http_origin $gev_app_origin {
     default $http_origin;
     "https://__DOMAIN__" "http://__DOMAIN__";
   }
 
+  # POWER UP is stricter: saving credentials must originate from
+  # this exact authenticated public page.
   map $http_origin $gev_setup_origin_state {
-    default              bad;
-    ""                   none;
+    default bad;
+    "" none;
     "https://__DOMAIN__" same;
   }
 
@@ -603,8 +666,7 @@ http {
 
     client_max_body_size 32m;
 
-    # Only our Traefik middleware inserts the private token.
-    # Another container directly contacting nginx is rejected.
+    # Only our Traefik middleware knows/injects this token.
     if ($http_x_gev_edge_token != "__EDGE_TOKEN__") {
       return 403;
     }
@@ -613,11 +675,8 @@ http {
       return 444;
     }
 
-    # POWER UP status endpoint:
-    # Transform the authenticated external request into the loopback-local
-    # request shape expected by upstream GEV.
+    # Provider Settings status
     location = /api/setup/status {
-
       if ($request_method != GET) {
         return 405;
       }
@@ -629,6 +688,8 @@ http {
       proxy_pass http://127.0.0.1:4173;
       proxy_http_version 1.1;
 
+      # Make this a genuine loopback/local-host request as required
+      # by the upstream Provider Settings admission gate.
       proxy_set_header Host "localhost:4173";
       proxy_set_header Origin "http://localhost:4173";
 
@@ -642,34 +703,32 @@ http {
       proxy_set_header X-Forwarded-Host "";
       proxy_set_header X-Forwarded-Port "";
       proxy_set_header X-Forwarded-Proto "";
+      proxy_set_header X-Real-IP "";
+      proxy_set_header CF-Connecting-IP "";
+      proxy_set_header CF-Ray "";
+
+      # Also strip neighboring/common proxy/CDN identity headers.
       proxy_set_header X-Forwarded-Server "";
       proxy_set_header X-Forwarded-Scheme "";
       proxy_set_header X-Forwarded-Protocol "";
       proxy_set_header X-Forwarded-Ssl "";
-      proxy_set_header X-Real-IP "";
       proxy_set_header True-Client-IP "";
-
-      proxy_set_header CF-Connecting-IP "";
       proxy_set_header CF-Connecting-IPv6 "";
-      proxy_set_header CF-Ray "";
       proxy_set_header CF-Visitor "";
       proxy_set_header CDN-Loop "";
 
       proxy_buffering off;
       proxy_request_buffering off;
-
       proxy_read_timeout 60s;
       proxy_send_timeout 60s;
     }
 
-    # POWER UP credential-save endpoint.
+    # Provider Settings save
     location = /api/setup/keys {
-
       if ($request_method != POST) {
         return 405;
       }
 
-      # Saving credentials must originate from the exact public GEV page.
       if ($gev_setup_origin_state != same) {
         return 403;
       }
@@ -690,71 +749,63 @@ http {
       proxy_set_header X-Forwarded-Host "";
       proxy_set_header X-Forwarded-Port "";
       proxy_set_header X-Forwarded-Proto "";
+      proxy_set_header X-Real-IP "";
+      proxy_set_header CF-Connecting-IP "";
+      proxy_set_header CF-Ray "";
+
       proxy_set_header X-Forwarded-Server "";
       proxy_set_header X-Forwarded-Scheme "";
       proxy_set_header X-Forwarded-Protocol "";
       proxy_set_header X-Forwarded-Ssl "";
-      proxy_set_header X-Real-IP "";
       proxy_set_header True-Client-IP "";
-
-      proxy_set_header CF-Connecting-IP "";
       proxy_set_header CF-Connecting-IPv6 "";
-      proxy_set_header CF-Ray "";
       proxy_set_header CF-Visitor "";
       proxy_set_header CDN-Loop "";
 
       proxy_buffering off;
       proxy_request_buffering off;
-
       proxy_read_timeout 60s;
       proxy_send_timeout 60s;
     }
 
-    # Everything else goes to the normal GEV application.
+    # Normal GEV app and provider APIs
     location / {
-
       proxy_pass http://127.0.0.1:4173;
       proxy_http_version 1.1;
 
       proxy_set_header Host $host;
       proxy_set_header Origin $gev_app_origin;
 
-      # Needed for Vite HMR / WebSockets.
+      # Vite/HMR/realtime WebSocket compatibility.
       proxy_set_header Upgrade $http_upgrade;
       proxy_set_header Connection $connection_upgrade;
 
-      # Do not leak HTTP BasicAuth credentials to GEV.
+      # Never leak HTTP BasicAuth credentials into GEV.
       proxy_set_header Authorization "";
       proxy_set_header Proxy-Authorization "";
       proxy_set_header X-GEV-Edge-Token "";
 
-      # GEV deliberately refuses requests carrying reverse-proxy signals.
-      # Strip the complete current upstream deny-list plus neighboring
-      # common proxy/CDN headers.
+      # Current GEV security policy refuses reverse-proxy signals.
       proxy_set_header Forwarded "";
       proxy_set_header Via "";
-
       proxy_set_header X-Forwarded-For "";
       proxy_set_header X-Forwarded-Host "";
       proxy_set_header X-Forwarded-Port "";
       proxy_set_header X-Forwarded-Proto "";
+      proxy_set_header X-Real-IP "";
+      proxy_set_header CF-Connecting-IP "";
+      proxy_set_header CF-Ray "";
+
       proxy_set_header X-Forwarded-Server "";
       proxy_set_header X-Forwarded-Scheme "";
       proxy_set_header X-Forwarded-Protocol "";
       proxy_set_header X-Forwarded-Ssl "";
-
-      proxy_set_header X-Real-IP "";
       proxy_set_header True-Client-IP "";
-
-      proxy_set_header CF-Connecting-IP "";
       proxy_set_header CF-Connecting-IPv6 "";
-      proxy_set_header CF-Ray "";
       proxy_set_header CF-Visitor "";
-
       proxy_set_header CDN-Loop "";
 
-      # Origin and Sec-Fetch-* are intentionally NOT blindly removed:
-      # they remain part of GEV's own cross-site protections.
+      # Range, Sec-Fetch-* and ordinary request headers remain intact.
       proxy_buffering off;
       proxy_request_buffering off;
 
@@ -769,6 +820,11 @@ sed -i \
   -e "s/__DOMAIN__/${DOMAIN}/g" \
   -e "s/__EDGE_TOKEN__/${EDGE_TOKEN}/g" \
   "$APP_ROOT/nginx.conf"
+
+
+# ============================================================
+# RUNTIME ENTRYPOINT
+# ============================================================
 
 cat > "$APP_ROOT/runtime-entrypoint.sh" <<'EOF'
 #!/usr/bin/env bash
@@ -785,7 +841,6 @@ mkdir -p \
 
 nginx -t -c /etc/nginx/nginx.conf
 
-# Vite is deliberately bound only to loopback.
 node node_modules/vite/bin/vite.js \
   --host 127.0.0.1 \
   --port 4173 \
@@ -796,7 +851,6 @@ GEV_PID=$!
 READY=0
 
 for _ in $(seq 1 60); do
-
   if ! kill -0 "$GEV_PID" 2>/dev/null; then
     wait "$GEV_PID" || true
     printf 'GEV exited before becoming ready.\n' >&2
@@ -812,18 +866,13 @@ for _ in $(seq 1 60); do
   fi
 
   sleep 1
-
 done
 
 if (( READY != 1 )); then
-
   printf 'GEV did not become ready on 127.0.0.1:4173.\n' >&2
-
   kill -TERM "$GEV_PID" 2>/dev/null || true
   wait "$GEV_PID" 2>/dev/null || true
-
   exit 1
-
 fi
 
 nginx \
@@ -833,14 +882,8 @@ nginx \
 NGINX_PID=$!
 
 cleanup() {
-
   trap - TERM INT
-
-  kill -TERM \
-    "$NGINX_PID" \
-    "$GEV_PID" \
-    2>/dev/null || true
-
+  kill -TERM "$NGINX_PID" "$GEV_PID" 2>/dev/null || true
   wait "$NGINX_PID" 2>/dev/null || true
   wait "$GEV_PID" 2>/dev/null || true
 }
@@ -848,16 +891,18 @@ cleanup() {
 trap 'cleanup; exit 0' TERM INT
 
 set +e
-
 wait -n "$GEV_PID" "$NGINX_PID"
 RC=$?
-
 set -e
 
 cleanup
-
 exit "$RC"
 EOF
+
+
+# ============================================================
+# HEALTHCHECK
+# ============================================================
 
 cat > "$APP_ROOT/healthcheck.mjs" <<'EOF'
 import http from 'node:http';
@@ -881,20 +926,19 @@ const req = http.request(
   },
   (res) => {
     res.resume();
-    res.on('end', () => {
-      process.exit(res.statusCode === 200 ? 0 : 1);
-    });
+    res.on('end', () => process.exit(res.statusCode === 200 ? 0 : 1));
   },
 );
 
-req.setTimeout(4000, () => {
-  req.destroy(new Error('health timeout'));
-});
-
+req.setTimeout(4000, () => req.destroy(new Error('health timeout')));
 req.on('error', () => process.exit(1));
-
 req.end();
 EOF
+
+
+# ============================================================
+# DOCKER IMAGE
+# ============================================================
 
 cat > "$APP_ROOT/.dockerignore" <<'EOF'
 *
@@ -904,15 +948,16 @@ cat > "$APP_ROOT/.dockerignore" <<'EOF'
 !healthcheck.mjs
 EOF
 
-chmod 600 "$APP_ROOT/.dockerignore"
-
 cat > "$APP_ROOT/Dockerfile" <<EOF
 FROM ${NODE_IMAGE}
 
 USER root
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends bash nginx ca-certificates \
+    && apt-get install -y --no-install-recommends \
+       bash \
+       nginx \
+       ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p \
        /tmp/gev-nginx/client_body \
@@ -935,13 +980,36 @@ COPY --chown=node:node --chmod=755 \
   /usr/local/bin/gev-healthcheck.mjs
 
 USER node
-
 WORKDIR /app
 
 EXPOSE 8080
 
 ENTRYPOINT ["/usr/local/bin/gev-runtime"]
 EOF
+
+
+# ============================================================
+# COMPOSE — GENERATED FOR THE DETECTED TRAEFIK LAYOUT
+# ============================================================
+
+NETWORK_LABEL_BLOCK=""
+SERVICE_NETWORK_BLOCK=""
+TOP_NETWORK_BLOCK=""
+
+if [[ "$TRAEFIK_MODE" == "shared" ]]; then
+  NETWORK_LABEL_BLOCK="      - 'traefik.docker.network=${TRAEFIK_NETWORK}'"
+  SERVICE_NETWORK_BLOCK="    networks:
+      - ${TRAEFIK_NETWORK}"
+  TOP_NETWORK_BLOCK="networks:
+  ${TRAEFIK_NETWORK}:
+    external: true"
+else
+  SERVICE_NETWORK_BLOCK="    networks:
+      - gev-private"
+  TOP_NETWORK_BLOCK="networks:
+  gev-private:
+    driver: bridge"
+fi
 
 cat > "$APP_ROOT/docker-compose.yml" <<EOF
 services:
@@ -962,19 +1030,17 @@ services:
     init: true
 
     environment:
-
       HOME: /home/node
 
       HOST: 127.0.0.1
       PORT: 4173
 
       GEV_ALLOWED_HOSTS: ${DOMAIN}
-
       GEV_PUBLIC_HOST: ${DOMAIN}
       GEV_EDGE_TOKEN: ${EDGE_TOKEN}
 
-      # Native GEV/Pinokio sharing stays disabled.
-      # Remote access happens exclusively through Traefik.
+      # Keep GEV's own sharing/tunnel modes off. Public access is
+      # exclusively through this authenticated Traefik route.
       PINOKIO_SHARE_CLOUDFLARE: "false"
       PINOKIO_SHARE_LOCAL: "false"
       PINOKIO_SHARE_VAR: "__gev_sharing_disabled__"
@@ -982,45 +1048,28 @@ services:
       PUPPETEER_SKIP_DOWNLOAD: "true"
 
     volumes:
-
       - ./app:/app
-
       - gev-node-modules:/app/node_modules
-
       - ./state/cache:/app/.gev-cache
       - ./state/logs:/app/.gev-logs
 
-    networks:
+    expose:
+      - "8080"
 
-      - traefik-proxy
+${SERVICE_NETWORK_BLOCK}
 
     labels:
-
       - 'traefik.enable=true'
-
-      - 'traefik.docker.network=${TRAEFIK_NETWORK}'
-
+${NETWORK_LABEL_BLOCK}
       - 'traefik.http.services.${ROUTER_ID}.loadbalancer.server.port=8080'
 
-      # HTTP -> HTTPS
-      - 'traefik.http.routers.${ROUTER_ID}-http.rule=Host(\`${DOMAIN}\`)'
-      - 'traefik.http.routers.${ROUTER_ID}-http.entrypoints=web'
-      - 'traefik.http.routers.${ROUTER_ID}-http.service=${ROUTER_ID}'
-      - 'traefik.http.routers.${ROUTER_ID}-http.middlewares=${ROUTER_ID}-https-redirect@docker'
-
-      - 'traefik.http.middlewares.${ROUTER_ID}-https-redirect.redirectscheme.scheme=https'
-      - 'traefik.http.middlewares.${ROUTER_ID}-https-redirect.redirectscheme.permanent=true'
-
-      # HTTPS router
       - 'traefik.http.routers.${ROUTER_ID}.rule=Host(\`${DOMAIN}\`)'
       - 'traefik.http.routers.${ROUTER_ID}.entrypoints=websecure'
-
       - 'traefik.http.routers.${ROUTER_ID}.service=${ROUTER_ID}'
-
       - 'traefik.http.routers.${ROUTER_ID}.tls=true'
       - 'traefik.http.routers.${ROUTER_ID}.tls.certresolver=${CERT_RESOLVER}'
 
-      # Authentication happens before the edge token is injected.
+      # Authenticate first; inject private internal marker second.
       - 'traefik.http.routers.${ROUTER_ID}.middlewares=${ROUTER_ID}-auth@docker,${ROUTER_ID}-edge@docker'
 
       - 'traefik.http.middlewares.${ROUTER_ID}-auth.basicauth.users=${AUTH_ESCAPED}'
@@ -1030,14 +1079,12 @@ services:
       - 'traefik.http.middlewares.${ROUTER_ID}-edge.headers.customrequestheaders.X-GEV-Edge-Token=${EDGE_TOKEN}'
 
     healthcheck:
-
       test:
         [
           "CMD",
           "node",
           "/usr/local/bin/gev-healthcheck.mjs"
         ]
-
       interval: 10s
       timeout: 5s
       retries: 24
@@ -1049,21 +1096,16 @@ services:
   gev-maintenance:
 
     image: ${NODE_IMAGE}
-
     user: "${APP_UID}:${APP_GID}"
-
     working_dir: /app
 
     environment:
-
       HOME: /home/node
       PUPPETEER_SKIP_DOWNLOAD: "true"
 
     volumes:
-
       - ./app:/app
       - gev-node-modules:/app/node_modules
-
       - ./state/cache:/app/.gev-cache
       - ./state/logs:/app/.gev-logs
 
@@ -1071,46 +1113,72 @@ services:
       - maintenance
 
 
-networks:
-
-  traefik-proxy:
-    external: true
+${TOP_NETWORK_BLOCK}
 
 
 volumes:
-
   gev-node-modules:
 EOF
 
-chmod 600 "$APP_ROOT/docker-compose.yml"
-chmod 600 "$APP_ROOT/nginx.conf"
+chmod 600 \
+  "$APP_ROOT/docker-compose.yml" \
+  "$APP_ROOT/nginx.conf" \
+  "$APP_ROOT/.dockerignore"
+
 chmod 755 "$APP_ROOT/runtime-entrypoint.sh"
 
 chmod 644 \
   "$APP_ROOT/healthcheck.mjs" \
   "$APP_ROOT/Dockerfile"
 
-chown "$APP_UID:$APP_GID" \
-  "$APP_ROOT/nginx.conf"
 
-say "Validating Docker Compose configuration"
+# ============================================================
+# STATIC VALIDATION
+# ============================================================
 
 cd "$APP_ROOT"
 
+say "Validating Docker Compose configuration"
 docker compose config -q
 
-say "Building the local GEV runtime image"
+if docker compose config \
+  | grep -Eq 'published:|host_ip:'
+then
+  die "Safety check failed: generated Compose unexpectedly publishes a host port."
+fi
 
-docker compose build \
-  --pull \
-  gods-eye-view
+
+# ============================================================
+# BUILD / TEST OFFICIAL GEV
+# ============================================================
+
+say "Building the local runtime image"
+docker compose build --pull gods-eye-view
 
 say "Pulling the Node maintenance image"
+docker compose pull gev-maintenance
 
-docker compose pull \
-  gev-maintenance
+say "Verifying the Node runtime version"
 
-say "Preparing the persistent node_modules volume"
+NODE_RUNTIME_VERSION="$(
+  docker compose run \
+    --rm \
+    --no-deps \
+    gev-maintenance \
+    node -p 'process.versions.node'
+)"
+
+[[ "$NODE_RUNTIME_VERSION" =~ ^24\.([0-9]+)\.([0-9]+)$ ]] ||
+  die "The selected Node image returned an unsupported runtime: ${NODE_RUNTIME_VERSION:-unknown}"
+
+NODE_MINOR="${BASH_REMATCH[1]}"
+
+(( NODE_MINOR >= 14 )) ||
+  die "God's Eye View requires Node 24.14.0 or newer within the Node 24 line.
+
+Detected: $NODE_RUNTIME_VERSION"
+
+say "Preparing persistent npm/cache directories"
 
 docker compose run \
   --rm \
@@ -1120,7 +1188,7 @@ docker compose run \
   sh -lc \
   'mkdir -p /app/node_modules /app/.gev-cache /app/.gev-logs && chown -R 1000:1000 /app/node_modules /app/.gev-cache /app/.gev-logs'
 
-say "Installing the exact locked npm dependencies"
+say "Installing the exact locked npm dependency tree"
 
 docker compose run \
   --rm \
@@ -1128,33 +1196,117 @@ docker compose run \
   gev-maintenance \
   npm ci --no-audit --no-fund
 
-say "Running the upstream setup doctor"
+say "Semantically verifying the GEV security gates this adapter depends on"
 
-# Missing optional provider credentials do not make the doctor fail.
+docker compose run \
+  --rm \
+  --no-deps \
+  gev-maintenance \
+  node --input-type=module -e '
+import { admitKeySetupRequest } from "./src/keySetupCore.mjs";
+import { admitSameSiteRequest, PROXY_SIGNALS } from "./src/localRequestGate.mjs";
+
+const expected = [
+  "forwarded",
+  "via",
+  "x-forwarded-for",
+  "x-forwarded-host",
+  "x-forwarded-port",
+  "x-forwarded-proto",
+  "x-real-ip",
+  "cf-connecting-ip",
+  "cf-ray",
+].sort();
+
+const actual = [...PROXY_SIGNALS].sort();
+
+if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+  throw new Error(`Unexpected PROXY_SIGNALS: ${actual.join(",")}`);
+}
+
+const keyOk = admitKeySetupRequest({
+  method: "POST",
+  remoteAddress: "127.0.0.1",
+  hostHeader: "localhost:4173",
+  protocol: "http:",
+  origin: "http://localhost:4173",
+  contentType: "application/json",
+  proxyHeaders: {},
+  env: {
+    PINOKIO_SHARE_CLOUDFLARE: "false",
+    PINOKIO_SHARE_LOCAL: "false",
+    PINOKIO_SHARE_VAR: "__gev_sharing_disabled__",
+  },
+});
+
+if (!keyOk.ok) {
+  throw new Error(`Expected Provider Settings loopback request to pass: ${JSON.stringify(keyOk)}`);
+}
+
+const keyPublic = admitKeySetupRequest({
+  method: "POST",
+  remoteAddress: "172.18.0.2",
+  hostHeader: "public.example",
+  protocol: "http:",
+  origin: "http://public.example",
+  contentType: "application/json",
+  proxyHeaders: {},
+  env: {},
+});
+
+if (keyPublic.ok) {
+  throw new Error("Provider Settings unexpectedly accepts a non-loopback caller");
+}
+
+const sameSiteOk = admitSameSiteRequest({
+  hostHeader: "public.example",
+  protocol: "http:",
+  origin: "http://public.example",
+  secFetchSite: "same-origin",
+  proxyHeaders: {},
+});
+
+if (!sameSiteOk.ok) {
+  throw new Error(`Expected normal same-origin provider request to pass: ${JSON.stringify(sameSiteOk)}`);
+}
+
+const proxied = admitSameSiteRequest({
+  hostHeader: "public.example",
+  protocol: "http:",
+  origin: "http://public.example",
+  secFetchSite: "same-origin",
+  proxyHeaders: { "x-forwarded-for": "203.0.113.1" },
+});
+
+if (proxied.ok) {
+  throw new Error("GEV unexpectedly accepts a forwarding-header signal");
+}
+
+console.log("GEV security-gate contract: PASS");
+'
+
+say "Running GEV's setup doctor"
 docker compose run \
   --rm \
   --no-deps \
   gev-maintenance \
   npm run doctor
 
-say "Building God's Eye View with the current configuration"
-
+say "Building God's Eye View"
 docker compose run \
   --rm \
   --no-deps \
   gev-maintenance \
   npm run build
 
-say "Running the upstream unit test suite"
-
+say "Running GEV's upstream unit tests"
 docker compose run \
   --rm \
   --no-deps \
   gev-maintenance \
   npm test
 
-say "Validating the gateway configuration in the exact runtime image"
-
+say "Validating nginx in the exact runtime image"
 docker compose run \
   --rm \
   --no-deps \
@@ -1163,24 +1315,31 @@ docker compose run \
   -t \
   -c /etc/nginx/nginx.conf
 
-say "Starting the authenticated stack"
+
+# ============================================================
+# START GEV
+# ============================================================
+
+say "Starting God's Eye View"
 
 docker compose up \
   -d \
-  --force-recreate \
   --remove-orphans \
   gods-eye-view
 
-say "Waiting for God's Eye View + gateway + Provider Settings to become healthy"
+
+# ============================================================
+# CONTAINER HEALTH
+# ============================================================
+
+say "Waiting for the application and local POWER UP adapter to become healthy"
 
 HEALTH=""
 
 for _ in $(seq 1 60); do
-
   HEALTH="$(
     docker inspect \
-      --format \
-      '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' \
+      --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' \
       gods-eye-view \
       2>/dev/null \
       || true
@@ -1194,53 +1353,35 @@ for _ in $(seq 1 60); do
         "$HEALTH" == "exited" ||
         "$HEALTH" == "dead" ]]
   then
-
-    docker compose logs \
-      --tail=180 \
-      gods-eye-view \
-      || true
-
+    docker compose logs --tail=180 gods-eye-view || true
     die "God's Eye View entered state '$HEALTH'."
-
   fi
 
   sleep 5
-
 done
 
-[[ "$HEALTH" == "healthy" ]] || \
-  die "God's Eye View did not become healthy in time.
+[[ "$HEALTH" == "healthy" ]] ||
+  die "God's Eye View did not become healthy in time."
 
-Check:
 
-cd $APP_ROOT
-docker compose logs --tail=200 gods-eye-view"
+# ============================================================
+# NETWORK-SAFETY CHECKS
+# ============================================================
 
-# Nothing from this project may publish a host port.
-if [[ -n "$(docker port gods-eye-view 2>/dev/null || true)" ]]; then
-  die "Safety check failed: God's Eye View unexpectedly has a published host port."
-fi
+[[ -z "$(docker port gods-eye-view 2>/dev/null || true)" ]] ||
+  die "Safety check failed: God's Eye View unexpectedly publishes a host port."
 
-docker inspect \
-  gods-eye-view \
-  --format '{{json .NetworkSettings.Networks}}' \
-  | grep -Fq "\"${TRAEFIK_NETWORK}\"" || \
-    die "Safety check failed: runtime is not attached to '$TRAEFIK_NETWORK'."
-
-# 4173 must be IPv4 loopback-only.
-# 127.0.0.1 = 0100007F
-# 4173       = 104D
 TCP_TABLE="$(
   docker exec gods-eye-view \
-    sh -lc \
-    'cat /proc/net/tcp /proc/net/tcp6 2>/dev/null' \
+    sh -lc 'cat /proc/net/tcp /proc/net/tcp6 2>/dev/null' \
     || true
 )"
 
+# 4173 decimal = 0x104D, 127.0.0.1 = 0100007F in /proc/net/tcp.
 printf '%s\n' "$TCP_TABLE" \
   | grep -Eq \
     '(^|[[:space:]])0100007F:104D[[:space:]].*[[:space:]]0A([[:space:]]|$)' \
-  || die "Safety check failed: GEV is not listening on 127.0.0.1:4173 as intended."
+  || die "Safety check failed: GEV is not listening on 127.0.0.1:4173."
 
 if printf '%s\n' "$TCP_TABLE" \
   | grep -Eq \
@@ -1251,15 +1392,101 @@ fi
 
 unset TCP_TABLE
 
-say "Checking the POWER UP local-only adapter"
 
-# Empty JSON is deliberately invalid.
-# HTTP 400 proves the request passed GEV's local-only security gate
-# without changing any credentials.
+# ============================================================
+# VERIFY TRAEFIK -> GEV PRIVATE CONNECTIVITY
+# ============================================================
+
+say "Verifying Traefik-side private connectivity"
+
+if [[ "$TRAEFIK_MODE" == "host" ]]; then
+  GEV_CONTAINER_IP="$(
+    docker inspect gods-eye-view \
+      --format '{{range .NetworkSettings.Networks}}{{println .IPAddress}}{{end}}' \
+      | awk 'NF{print; exit}'
+  )"
+
+  [[ -n "$GEV_CONTAINER_IP" ]] ||
+    die "Could not determine the GEV private Docker IP."
+
+  PRIVATE_ROUTE_CODE="$(
+    curl \
+      -sS \
+      --connect-timeout 5 \
+      --max-time 10 \
+      -H "Host: ${DOMAIN}" \
+      -H "Origin: https://${DOMAIN}" \
+      -H "X-GEV-Edge-Token: ${EDGE_TOKEN}" \
+      -o /dev/null \
+      -w '%{http_code}' \
+      "http://${GEV_CONTAINER_IP}:8080/api/setup/status" \
+      2>/dev/null \
+      || true
+  )"
+
+else
+  GEV_CONTAINER_IP="$(
+    docker inspect gods-eye-view \
+      --format '{{range $name, $cfg := .NetworkSettings.Networks}}{{println $name $cfg.IPAddress}}{{end}}' \
+      | awk -v wanted="$TRAEFIK_NETWORK" '$1 == wanted {print $2; exit}'
+  )"
+
+  [[ -n "$GEV_CONTAINER_IP" ]] ||
+    die "Could not determine GEV's IP on the shared Traefik network '$TRAEFIK_NETWORK'."
+
+  PRIVATE_ROUTE_CODE="$(
+    docker run \
+      --rm \
+      --network "$TRAEFIK_NETWORK" \
+      -e GEV_TEST_HOST="$DOMAIN" \
+      -e GEV_TEST_TOKEN="$EDGE_TOKEN" \
+      -e GEV_TEST_IP="$GEV_CONTAINER_IP" \
+      "$NODE_IMAGE" \
+      node -e '
+const http = require("node:http");
+
+const req = http.request(
+  {
+    hostname: process.env.GEV_TEST_IP,
+    port: 8080,
+    path: "/api/setup/status",
+    method: "GET",
+    headers: {
+      Host: process.env.GEV_TEST_HOST,
+      Origin: `https://${process.env.GEV_TEST_HOST}`,
+      "X-GEV-Edge-Token": process.env.GEV_TEST_TOKEN,
+    },
+  },
+  (res) => {
+    res.resume();
+    res.on("end", () => process.stdout.write(String(res.statusCode)));
+  },
+);
+
+req.setTimeout(5000, () => req.destroy(new Error("timeout")));
+req.on("error", () => process.exit(2));
+req.end();
+' 2>/dev/null \
+      || true
+  )"
+fi
+
+[[ "$PRIVATE_ROUTE_CODE" == "200" ]] ||
+  die "The active Traefik networking layout cannot reach the GEV gateway correctly.
+
+Expected HTTP 200 from the private /api/setup/status path.
+Received: ${PRIVATE_ROUTE_CODE:-no response}"
+
+
+# ============================================================
+# LOCAL POWER UP ADAPTER TEST
+# ============================================================
+
+say "Testing the POWER UP loopback adapter"
+
 LOCAL_SETUP_POST_CODE="$(
   docker exec gods-eye-view node -e '
 const http = require("node:http");
-
 const host = process.env.GEV_PUBLIC_HOST;
 const token = process.env.GEV_EDGE_TOKEN;
 
@@ -1274,27 +1501,30 @@ const req = http.request(
       Origin: `https://${host}`,
       "Sec-Fetch-Site": "same-origin",
       "Content-Type": "application/json",
-      "X-GEV-Edge-Token": token
-    }
+      "X-GEV-Edge-Token": token,
+    },
   },
-  res => {
+  (res) => {
     res.resume();
     res.on("end", () => process.stdout.write(String(res.statusCode)));
-  }
+  },
 );
 
 req.on("error", () => process.exit(2));
 req.end("{}");
-' 2>/dev/null || true
+' 2>/dev/null \
+    || true
 )"
 
-[[ "$LOCAL_SETUP_POST_CODE" == "400" ]] || \
-  die "POWER UP local adapter self-test failed (expected harmless HTTP 400, got ${LOCAL_SETUP_POST_CODE:-none})."
+[[ "$LOCAL_SETUP_POST_CODE" == "400" ]] ||
+  die "POWER UP loopback admission failed.
+
+An empty save should pass GEV's local security gate and then return HTTP 400.
+Received: ${LOCAL_SETUP_POST_CODE:-no response}"
 
 LOCAL_BAD_ORIGIN_CODE="$(
   docker exec gods-eye-view node -e '
 const http = require("node:http");
-
 const host = process.env.GEV_PUBLIC_HOST;
 const token = process.env.GEV_EDGE_TOKEN;
 
@@ -1309,104 +1539,43 @@ const req = http.request(
       Origin: "https://example.invalid",
       "Sec-Fetch-Site": "cross-site",
       "Content-Type": "application/json",
-      "X-GEV-Edge-Token": token
-    }
+      "X-GEV-Edge-Token": token,
+    },
   },
-  res => {
+  (res) => {
     res.resume();
     res.on("end", () => process.stdout.write(String(res.statusCode)));
-  }
+  },
 );
 
 req.on("error", () => process.exit(2));
 req.end("{}");
-' 2>/dev/null || true
-)"
-
-[[ "$LOCAL_BAD_ORIGIN_CODE" == "403" ]] || \
-  die "POWER UP cross-origin local self-test failed (expected HTTP 403, got ${LOCAL_BAD_ORIGIN_CODE:-none})."
-
-RESOLVED_IP="$(
-  getent ahostsv4 "$DOMAIN" 2>/dev/null \
-    | awk 'NR==1{print $1}' \
+' 2>/dev/null \
     || true
 )"
 
-VPS_IP="$(
-  ip -4 route get 1.1.1.1 2>/dev/null \
-    | awk \
-      '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' \
-    || true
-)"
+[[ "$LOCAL_BAD_ORIGIN_CODE" == "403" ]] ||
+  die "POWER UP cross-origin protection failed.
 
-if [[ -z "$RESOLVED_IP" ]]; then
+Expected HTTP 403.
+Received: ${LOCAL_BAD_ORIGIN_CODE:-no response}"
 
-  if [[ "$DOMAIN" == *.hstgr.cloud ]]; then
 
-    warn "$DOMAIN has not appeared in DNS yet.
+# ============================================================
+# MANDATORY PUBLIC HTTPS + BASIC AUTH VALIDATION
+# ============================================================
 
-Hostinger-managed temporary hostnames normally resolve automatically;
-Traefik/HTTPS will become available once Hostinger DNS sees the hostname."
-
-  else
-
-    warn "$DOMAIN does not currently resolve in DNS.
-
-Point it to this VPS before expecting HTTPS to work."
-
-  fi
-
-elif [[ -n "$VPS_IP" && "$RESOLVED_IP" != "$VPS_IP" ]]; then
-
-  warn "$DOMAIN currently resolves to $RESOLVED_IP while this VPS reports $VPS_IP.
-
-This can be intentional, for example when a proxy/CDN is in front."
-
-fi
-
-say "Checking HTTPS and authentication"
+say "Waiting for public HTTPS and BasicAuth to become ready"
 
 NOAUTH_CODE=""
 AUTH_CODE=""
-TLS_OK=0
 
-# Do not use curl -k.
-# Public verification only passes with a valid certificate.
-if [[ -n "$RESOLVED_IP" ]]; then
-
-  for _ in $(seq 1 18); do
-
-    NOAUTH_CODE="$(
-      curl \
-        -sS \
-        --connect-timeout 8 \
-        --max-time 20 \
-        -o /dev/null \
-        -w '%{http_code}' \
-        "https://${DOMAIN}/" \
-        2>/dev/null \
-        || true
-    )"
-
-    if [[ "$NOAUTH_CODE" == "401" ]]; then
-      TLS_OK=1
-      break
-    fi
-
-    sleep 5
-
-  done
-
-fi
-
-if (( TLS_OK == 1 )); then
-
-  AUTH_CODE="$(
+for _ in $(seq 1 90); do
+  NOAUTH_CODE="$(
     curl \
       -sS \
       --connect-timeout 8 \
       --max-time 20 \
-      -u "${AUTH_USER}:${AUTH_PASS}" \
       -o /dev/null \
       -w '%{http_code}' \
       "https://${DOMAIN}/" \
@@ -1414,116 +1583,188 @@ if (( TLS_OK == 1 )); then
       || true
   )"
 
+  if [[ "$NOAUTH_CODE" == "401" ]]; then
+    break
+  fi
+
+  sleep 5
+done
+
+if [[ "$NOAUTH_CODE" != "401" ]]; then
+  printf '\n--- Traefik logs ---\n' >&2
+  docker logs --tail=120 "$TRAEFIK_CONTAINER" 2>&1 >&2 || true
+
+  printf '\n--- GEV logs ---\n' >&2
+  docker compose logs --tail=120 gods-eye-view >&2 || true
+
+  die "Public HTTPS did not reach the expected BasicAuth challenge.
+
+URL:
+https://${DOMAIN}
+
+Last HTTP status:
+${NOAUTH_CODE:-no response}
+
+The installer will not report success unless the public authenticated URL is actually usable."
 fi
 
-AUTH_STATUS="pending DNS/valid HTTPS certificate"
+AUTH_CODE="$(
+  curl \
+    -sS \
+    --connect-timeout 8 \
+    --max-time 20 \
+    -u "${AUTH_USER}:${AUTH_PASS}" \
+    -o /dev/null \
+    -w '%{http_code}' \
+    "https://${DOMAIN}/" \
+    2>/dev/null \
+    || true
+)"
 
-if [[ "$NOAUTH_CODE" == "401" &&
-      "$AUTH_CODE" =~ ^(200|301|302|304)$ ]]
-then
+[[ "$AUTH_CODE" =~ ^(200|301|302|304)$ ]] ||
+  die "BasicAuth challenged correctly, but the authenticated application request failed.
 
-  AUTH_STATUS="verified with valid HTTPS (anonymous=401, authenticated=${AUTH_CODE})"
+HTTP status: ${AUTH_CODE:-no response}"
 
-elif [[ "$NOAUTH_CODE" == "401" ]]; then
 
-  AUTH_STATUS="valid HTTPS + anonymous access blocked; authenticated request returned ${AUTH_CODE}"
+# ============================================================
+# REMOTE POWER UP VALIDATION
+# ============================================================
 
-elif [[ -n "$RESOLVED_IP" ]]; then
+say "Testing POWER UP through the real public HTTPS route"
 
-  warn "The container is healthy, but a TLS-verified request to:
+SETUP_STATUS_CODE="$(
+  curl \
+    -sS \
+    --connect-timeout 8 \
+    --max-time 20 \
+    -u "${AUTH_USER}:${AUTH_PASS}" \
+    -H "Origin: https://${DOMAIN}" \
+    -o /dev/null \
+    -w '%{http_code}' \
+    "https://${DOMAIN}/api/setup/status" \
+    2>/dev/null \
+    || true
+)"
 
-https://${DOMAIN}/
+SETUP_POST_CODE="$(
+  curl \
+    -sS \
+    --connect-timeout 8 \
+    --max-time 20 \
+    -u "${AUTH_USER}:${AUTH_PASS}" \
+    -H "Origin: https://${DOMAIN}" \
+    -H 'Sec-Fetch-Site: same-origin' \
+    -H 'Content-Type: application/json' \
+    --data '{}' \
+    -o /dev/null \
+    -w '%{http_code}' \
+    "https://${DOMAIN}/api/setup/keys" \
+    2>/dev/null \
+    || true
+)"
 
-did not reach the expected BasicAuth 401 yet.
+SETUP_BAD_ORIGIN_CODE="$(
+  curl \
+    -sS \
+    --connect-timeout 8 \
+    --max-time 20 \
+    -u "${AUTH_USER}:${AUTH_PASS}" \
+    -H 'Origin: https://example.invalid' \
+    -H 'Sec-Fetch-Site: cross-site' \
+    -H 'Content-Type: application/json' \
+    --data '{}' \
+    -o /dev/null \
+    -w '%{http_code}' \
+    "https://${DOMAIN}/api/setup/keys" \
+    2>/dev/null \
+    || true
+)"
 
-Check:
-  • DNS
-  • ports 80/443
-  • Traefik logs
-  • Let's Encrypt issuance
+[[ "$SETUP_STATUS_CODE" == "200" ]] ||
+  die "Remote POWER UP status endpoint failed (HTTP ${SETUP_STATUS_CODE:-none})."
 
-If Cloudflare proxying is enabled, temporarily disabling the proxy can simplify first certificate issuance."
+[[ "$SETUP_POST_CODE" == "400" ]] ||
+  die "Remote POWER UP save admission failed.
 
-fi
+Expected harmless HTTP 400 after passing the local-only gate.
+Received: ${SETUP_POST_CODE:-none}"
 
-SETUP_STATUS_CODE=""
-SETUP_POST_CODE=""
-SETUP_BAD_ORIGIN_CODE=""
+[[ "$SETUP_BAD_ORIGIN_CODE" == "403" ]] ||
+  die "Remote POWER UP cross-origin protection failed.
 
-if [[ "$AUTH_CODE" =~ ^(200|301|302|304)$ ]]; then
+Expected HTTP 403.
+Received: ${SETUP_BAD_ORIGIN_CODE:-none}"
 
-  SETUP_STATUS_CODE="$(
-    curl \
-      -sS \
-      --connect-timeout 8 \
-      --max-time 20 \
-      -u "${AUTH_USER}:${AUTH_PASS}" \
-      -H "Origin: https://${DOMAIN}" \
-      -o /dev/null \
-      -w '%{http_code}' \
-      "https://${DOMAIN}/api/setup/status" \
-      2>/dev/null \
-      || true
-  )"
 
-  SETUP_POST_CODE="$(
-    curl \
-      -sS \
-      --connect-timeout 8 \
-      --max-time 20 \
-      -u "${AUTH_USER}:${AUTH_PASS}" \
-      -H "Origin: https://${DOMAIN}" \
-      -H 'Sec-Fetch-Site: same-origin' \
-      -H 'Content-Type: application/json' \
-      --data '{}' \
-      -o /dev/null \
-      -w '%{http_code}' \
-      "https://${DOMAIN}/api/setup/keys" \
-      2>/dev/null \
-      || true
-  )"
+# ============================================================
+# NORMAL COST-BEARING GATE VALIDATION
+#
+# We intentionally do not require a specific application result here;
+# no OpenAI key may be configured yet. We only ensure the authenticated,
+# same-origin proxy path is NOT being rejected by the proxy-header gate.
+# ============================================================
 
-  SETUP_BAD_ORIGIN_CODE="$(
-    curl \
-      -sS \
-      --connect-timeout 8 \
-      --max-time 20 \
-      -u "${AUTH_USER}:${AUTH_PASS}" \
-      -H 'Origin: https://example.invalid' \
-      -H 'Sec-Fetch-Site: cross-site' \
-      -H 'Content-Type: application/json' \
-      --data '{}' \
-      -o /dev/null \
-      -w '%{http_code}' \
-      "https://${DOMAIN}/api/setup/keys" \
-      2>/dev/null \
-      || true
-  )"
+say "Testing the normal provider-route security adapter"
 
-  [[ "$SETUP_STATUS_CODE" == "200" ]] || \
-    die "POWER UP Provider Settings status self-test failed (HTTP ${SETUP_STATUS_CODE:-none})."
+NORMAL_PROVIDER_CODE="$(
+  curl \
+    -sS \
+    --connect-timeout 8 \
+    --max-time 20 \
+    -u "${AUTH_USER}:${AUTH_PASS}" \
+    -H "Origin: https://${DOMAIN}" \
+    -H 'Sec-Fetch-Site: same-origin' \
+    -H 'Content-Type: application/json' \
+    --data '{}' \
+    -o /dev/null \
+    -w '%{http_code}' \
+    "https://${DOMAIN}/api/realtime/token" \
+    2>/dev/null \
+    || true
+)"
 
-  [[ "$SETUP_POST_CODE" == "400" ]] || \
-    die "POWER UP Provider Settings save admission self-test failed (expected harmless HTTP 400, got ${SETUP_POST_CODE:-none})."
+[[ -n "$NORMAL_PROVIDER_CODE" &&
+   "$NORMAL_PROVIDER_CODE" != "000" &&
+   "$NORMAL_PROVIDER_CODE" != "403" ]] ||
+  die "The normal provider-route adapter is still being rejected as proxied/cross-site.
 
-  [[ "$SETUP_BAD_ORIGIN_CODE" == "403" ]] || \
-    die "Provider Settings cross-origin protection self-test failed (expected 403, got ${SETUP_BAD_ORIGIN_CODE:-none})."
+HTTP status: ${NORMAL_PROVIDER_CODE:-none}"
 
-fi
+NORMAL_BAD_ORIGIN_CODE="$(
+  curl \
+    -sS \
+    --connect-timeout 8 \
+    --max-time 20 \
+    -u "${AUTH_USER}:${AUTH_PASS}" \
+    -H 'Origin: https://example.invalid' \
+    -H 'Sec-Fetch-Site: cross-site' \
+    -H 'Content-Type: application/json' \
+    --data '{}' \
+    -o /dev/null \
+    -w '%{http_code}' \
+    "https://${DOMAIN}/api/realtime/token" \
+    2>/dev/null \
+    || true
+)"
+
+[[ "$NORMAL_BAD_ORIGIN_CODE" == "403" ]] ||
+  die "The normal provider-route cross-origin protection did not return HTTP 403.
+
+Received: ${NORMAL_BAD_ORIGIN_CODE:-none}"
+
+
+# ============================================================
+# SMALL OPERATOR HELPERS
+# ============================================================
 
 cat > /usr/local/bin/restart-gods-eye-view <<'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
 cd /opt/gods-eye-view
-
-docker compose up \
-  -d \
-  --force-recreate \
-  gods-eye-view
+docker compose restart gods-eye-view
 EOF
-
-chmod 755 /usr/local/bin/restart-gods-eye-view
 
 cat > /usr/local/bin/doctor-gods-eye-view <<'EOF'
 #!/usr/bin/env bash
@@ -1537,368 +1778,6 @@ docker compose run \
   gev-maintenance \
   npm run doctor
 EOF
-
-chmod 755 /usr/local/bin/doctor-gods-eye-view
-
-cat > /usr/local/bin/update-gods-eye-view <<'EOF'
-#!/usr/bin/env bash
-set -Eeuo pipefail
-
-APP_ROOT=/opt/gods-eye-view
-SRC_DIR=$APP_ROOT/app
-
-APP_UID=1000
-APP_GID=1000
-
-cd "$SRC_DIR"
-
-GIT=(
-  git
-  -c
-  safe.directory="$SRC_DIR"
-  -C
-  "$SRC_DIR"
-)
-
-"${GIT[@]}" fetch \
-  --depth=1 \
-  origin main
-
-# Preflight target before taking the existing instance offline.
-PREFLIGHT_DIR="$(mktemp -d)"
-
-cleanup_preflight() {
-  rm -rf "$PREFLIGHT_DIR"
-}
-
-trap cleanup_preflight EXIT
-
-"${GIT[@]}" show \
-  origin/main:src/localRequestGate.mjs \
-  > "$PREFLIGHT_DIR/localRequestGate.mjs" || {
-    printf \
-      'Update refused: target revision is missing src/localRequestGate.mjs; current instance remains online.\n' \
-      >&2
-    exit 1
-  }
-
-"${GIT[@]}" show \
-  origin/main:src/keySetupCore.mjs \
-  > "$PREFLIGHT_DIR/keySetupCore.mjs" || {
-    printf \
-      'Update refused: target revision is missing src/keySetupCore.mjs; current instance remains online.\n' \
-      >&2
-    exit 1
-  }
-
-EXPECTED_PROXY_SIGNALS="cf-connecting-ip cf-ray forwarded via x-forwarded-for x-forwarded-host x-forwarded-port x-forwarded-proto x-real-ip"
-
-TARGET_PROXY_SIGNALS="$(
-  sed -n \
-    '/PROXY_SIGNALS = Object.freeze(\[/,/\]);/p' \
-    "$PREFLIGHT_DIR/localRequestGate.mjs" \
-    | grep -oE "'[^']+'" \
-    | tr -d "'" \
-    | sort \
-    | xargs \
-    || true
-)"
-
-if [[ "$TARGET_PROXY_SIGNALS" != "$EXPECTED_PROXY_SIGNALS" ]]; then
-
-  printf \
-    'Update refused: upstream proxy-signal policy changed; current instance remains online. Review/re-run the audited installer first.\n' \
-    >&2
-
-  exit 1
-
-fi
-
-grep -Fq \
-  'LOOPBACK_ADDRESSES' \
-  "$PREFLIGHT_DIR/keySetupCore.mjs" || {
-    printf \
-      'Update refused: Provider Settings loopback policy changed; current instance remains online.\n' \
-      >&2
-    exit 1
-  }
-
-grep -Fq \
-  'Provider Settings answers only local hostnames' \
-  "$PREFLIGHT_DIR/keySetupCore.mjs" || {
-    printf \
-      'Update refused: Provider Settings Host policy changed; current instance remains online.\n' \
-      >&2
-    exit 1
-  }
-
-grep -Fq \
-  'Provider Settings requires an exact local Origin' \
-  "$PREFLIGHT_DIR/keySetupCore.mjs" || {
-    printf \
-      'Update refused: Provider Settings Origin policy changed; current instance remains online.\n' \
-      >&2
-    exit 1
-  }
-
-rm -rf "$PREFLIGHT_DIR"
-trap - EXIT
-
-unset \
-  PREFLIGHT_DIR \
-  TARGET_PROXY_SIGNALS \
-  EXPECTED_PROXY_SIGNALS
-
-# Target is compatible. Stop runtime before replacing live source/dependencies.
-cd "$APP_ROOT"
-
-docker compose stop gods-eye-view
-
-cd "$SRC_DIR"
-
-"${GIT[@]}" reset \
-  --hard HEAD \
-  >/dev/null
-
-"${GIT[@]}" checkout \
-  -q \
-  -B main \
-  origin/main
-
-"${GIT[@]}" reset \
-  --hard origin/main \
-  >/dev/null
-
-[[ -f "$SRC_DIR/src/keySetupCore.mjs" &&
-   -f "$SRC_DIR/src/localRequestGate.mjs" ]] || {
-  printf \
-    'Update stopped: checked-out security-gate files disappeared unexpectedly.\n' \
-    >&2
-  exit 1
-}
-
-# Preserve existing values while adding newly introduced template variables.
-while IFS= read -r line || [[ -n "$line" ]]; do
-
-  if [[ "$line" =~ ^[[:space:]]*#?[[:space:]]*([A-Z][A-Z0-9_]*)=(.*)$ ]]; then
-
-    key="${BASH_REMATCH[1]}"
-
-    if ! grep -Eq \
-      "^[[:space:]]*#?[[:space:]]*${key}=" \
-      "$SRC_DIR/.env"
-    then
-
-      printf \
-        '\n# Added from newer upstream .env.example\n%s\n' \
-        "$line" \
-        >> "$SRC_DIR/.env"
-
-    fi
-
-  fi
-
-done < "$SRC_DIR/.env.example"
-
-chown -R \
-  "$APP_UID:$APP_GID" \
-  "$SRC_DIR"
-
-chmod 600 "$SRC_DIR/.env"
-
-cd "$APP_ROOT"
-
-docker compose config -q
-
-docker compose build \
-  --pull \
-  gods-eye-view
-
-docker compose pull \
-  gev-maintenance
-
-docker compose run \
-  --rm \
-  --no-deps \
-  --user 0:0 \
-  gev-maintenance \
-  sh -lc \
-  'mkdir -p /app/node_modules /app/.gev-cache /app/.gev-logs && chown -R 1000:1000 /app/node_modules /app/.gev-cache /app/.gev-logs'
-
-docker compose run \
-  --rm \
-  --no-deps \
-  gev-maintenance \
-  npm ci --no-audit --no-fund
-
-docker compose run \
-  --rm \
-  --no-deps \
-  gev-maintenance \
-  npm run doctor
-
-docker compose run \
-  --rm \
-  --no-deps \
-  gev-maintenance \
-  npm run build
-
-docker compose run \
-  --rm \
-  --no-deps \
-  gev-maintenance \
-  npm test
-
-docker compose run \
-  --rm \
-  --no-deps \
-  --entrypoint nginx \
-  gods-eye-view \
-  -t \
-  -c /etc/nginx/nginx.conf
-
-docker compose up \
-  -d \
-  --force-recreate \
-  gods-eye-view
-
-HEALTH=""
-
-for _ in $(seq 1 60); do
-
-  HEALTH="$(
-    docker inspect \
-      --format \
-      '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' \
-      gods-eye-view \
-      2>/dev/null \
-      || true
-  )"
-
-  if [[ "$HEALTH" == "healthy" ]]; then
-    break
-  fi
-
-  if [[ "$HEALTH" == "unhealthy" ||
-        "$HEALTH" == "exited" ||
-        "$HEALTH" == "dead" ]]
-  then
-
-    docker compose logs \
-      --tail=180 \
-      gods-eye-view \
-      || true
-
-    printf \
-      "Update failed: God's Eye View entered state %s.\n" \
-      "$HEALTH" \
-      >&2
-
-    exit 1
-
-  fi
-
-  sleep 5
-
-done
-
-[[ "$HEALTH" == "healthy" ]] || {
-  printf \
-    'Update did not reach healthy state in time.\n' \
-    >&2
-  exit 1
-}
-
-POST_CODE="$(
-  docker exec gods-eye-view node -e '
-const http = require("node:http");
-
-const host = process.env.GEV_PUBLIC_HOST;
-const token = process.env.GEV_EDGE_TOKEN;
-
-const req = http.request(
-  {
-    hostname: "127.0.0.1",
-    port: 8080,
-    path: "/api/setup/keys",
-    method: "POST",
-    headers: {
-      Host: host,
-      Origin: `https://${host}`,
-      "Sec-Fetch-Site": "same-origin",
-      "Content-Type": "application/json",
-      "X-GEV-Edge-Token": token
-    }
-  },
-  res => {
-    res.resume();
-    res.on("end", () => process.stdout.write(String(res.statusCode)));
-  }
-);
-
-req.on("error", () => process.exit(2));
-req.end("{}");
-' 2>/dev/null || true
-)"
-
-[[ "$POST_CODE" == "400" ]] || {
-  printf \
-    'Update failed: POWER UP adapter admission check returned %s (expected 400).\n' \
-    "${POST_CODE:-none}" \
-    >&2
-  exit 1
-}
-
-BAD_ORIGIN_CODE="$(
-  docker exec gods-eye-view node -e '
-const http = require("node:http");
-
-const host = process.env.GEV_PUBLIC_HOST;
-const token = process.env.GEV_EDGE_TOKEN;
-
-const req = http.request(
-  {
-    hostname: "127.0.0.1",
-    port: 8080,
-    path: "/api/setup/keys",
-    method: "POST",
-    headers: {
-      Host: host,
-      Origin: "https://example.invalid",
-      "Sec-Fetch-Site": "cross-site",
-      "Content-Type": "application/json",
-      "X-GEV-Edge-Token": token
-    }
-  },
-  res => {
-    res.resume();
-    res.on("end", () => process.stdout.write(String(res.statusCode)));
-  }
-);
-
-req.on("error", () => process.exit(2));
-req.end("{}");
-' 2>/dev/null || true
-)"
-
-[[ "$BAD_ORIGIN_CODE" == "403" ]] || {
-  printf \
-    'Update failed: POWER UP cross-origin check returned %s (expected 403).\n' \
-    "${BAD_ORIGIN_CODE:-none}" \
-    >&2
-  exit 1
-}
-
-printf \
-  'Updated to %s\n' \
-  "$(
-    git -c safe.directory="$SRC_DIR" \
-      -C "$SRC_DIR" \
-      rev-parse --short=12 HEAD
-  )"
-EOF
-
-chmod 755 /usr/local/bin/update-gods-eye-view
 
 cat > /usr/local/bin/edit-gods-eye-view-keys <<'EOF'
 #!/usr/bin/env bash
@@ -1917,22 +1796,43 @@ $EDITOR_CMD "$FILE"
 chown 1000:1000 "$FILE"
 chmod 600 "$FILE"
 
-printf '\nValidating provider configuration...\n'
-
 doctor-gods-eye-view
-
-printf '\nRestarting God\x27s Eye View so dotenv changes are reloaded...\n'
-
 restart-gods-eye-view
 EOF
 
-chmod 755 /usr/local/bin/edit-gods-eye-view-keys
+cat > /usr/local/bin/show-gods-eye-view-url <<EOF
+#!/usr/bin/env bash
+printf '%s\n' 'https://${DOMAIN}'
+EOF
 
-# Validate all generated helper scripts before declaring success.
+chmod 755 \
+  /usr/local/bin/restart-gods-eye-view \
+  /usr/local/bin/doctor-gods-eye-view \
+  /usr/local/bin/edit-gods-eye-view-keys \
+  /usr/local/bin/show-gods-eye-view-url
+
 bash -n /usr/local/bin/restart-gods-eye-view
 bash -n /usr/local/bin/doctor-gods-eye-view
-bash -n /usr/local/bin/update-gods-eye-view
 bash -n /usr/local/bin/edit-gods-eye-view-keys
+bash -n /usr/local/bin/show-gods-eye-view-url
+
+cat > "$APP_ROOT/INSTALL_INFO" <<EOF
+God's Eye View Hostinger installer
+GEV_VERSION=${UPSTREAM_VERSION}
+GEV_COMMIT=${UPSTREAM_COMMIT}
+NODE_IMAGE=${NODE_IMAGE}
+NODE_RUNTIME_VERSION=${NODE_RUNTIME_VERSION}
+PUBLIC_URL=https://${DOMAIN}
+TRAEFIK_CONTAINER=${TRAEFIK_CONTAINER}
+TRAEFIK_MODE=${TRAEFIK_MODE}
+EOF
+
+chmod 600 "$APP_ROOT/INSTALL_INFO"
+
+
+# ============================================================
+# FINISH
+# ============================================================
 
 unset \
   AUTH_PASS \
@@ -1942,65 +1842,46 @@ unset \
   PASS_BYTES \
   EDGE_TOKEN
 
-printf '\n\033[1;32m===============================================\033[0m\n'
-printf '\033[1;32m  God\x27s Eye View is deployed and protected\033[0m\n'
-printf '\033[1;32m===============================================\033[0m\n\n'
+printf '\n\033[1;32m====================================================\033[0m\n'
+printf '\033[1;32m  God\x27s Eye View installed successfully\033[0m\n'
+printf '\033[1;32m====================================================\033[0m\n\n'
 
-printf 'URL:              https://%s\n' "$DOMAIN"
-printf 'Hostname mode:    %s\n' "$HOST_MODE"
-printf 'Username:         %s\n' "$AUTH_USER"
-printf 'Authentication:   %s\n' "$AUTH_STATUS"
+printf 'URL:               https://%s\n' "$DOMAIN"
+printf 'Hostname mode:     %s\n' "$HOST_MODE"
+printf 'Traefik:           %s\n' "$TRAEFIK_CONTAINER"
+printf 'Traefik layout:    %s\n' "$TRAEFIK_MODE"
+printf 'Username:          %s\n' "$AUTH_USER"
 
-printf 'GEV version:      %s\n' \
-  "${UPSTREAM_VERSION:-unknown}"
+printf 'GEV version:       %s\n' "$UPSTREAM_VERSION"
+printf 'GEV commit:        %s\n' "$UPSTREAM_COMMIT"
+printf 'Node runtime:      %s\n' "$NODE_RUNTIME_VERSION"
 
-printf 'Upstream commit:  %s\n' \
-  "$UPSTREAM_COMMIT"
-
-printf 'Public exposure:  Traefik only; no host ports are published by GEV\n'
-
-printf 'GEV listener:     127.0.0.1:4173 inside the runtime container only\n'
-
-printf 'Provider Settings: remote POWER UP enabled behind BasicAuth + strict Origin validation\n'
-
-if [[ -n "$SETUP_STATUS_CODE" ]]; then
-
-  printf \
-    'POWER UP test:    status=%s, harmless-save=%s, bad-origin=%s\n' \
-    "$SETUP_STATUS_CODE" \
-    "$SETUP_POST_CODE" \
-    "$SETUP_BAD_ORIGIN_CODE"
-
-fi
+printf 'Authentication:    verified\n'
+printf 'HTTPS:             verified with a trusted certificate\n'
+printf 'Public host ports: none published by GEV\n'
+printf 'Gateway:           Docker-private :8080\n'
+printf 'GEV listener:      127.0.0.1:4173 only\n'
+printf 'POWER UP:          verified remotely behind BasicAuth\n'
+printf 'Cross-origin save: blocked\n'
+printf 'Provider route:    proxy-gate adapter verified (HTTP %s)\n' "$NORMAL_PROVIDER_CODE"
 
 printf '\n'
+printf 'Next step:\n'
+printf '  1. Open https://%s\n' "$DOMAIN"
+printf '  2. Log in with the username/password you just created.\n'
+printf '  3. Open POWER UP -> Provider Settings and add the provider keys you want.\n'
 
-printf 'Provider keys:    configure them in POWER UP -> Provider Settings after login\n'
+printf '\n'
+printf 'Useful commands:\n'
+printf '  show-gods-eye-view-url\n'
+printf '  doctor-gods-eye-view\n'
+printf '  restart-gods-eye-view\n'
+printf '  edit-gods-eye-view-keys   # advanced/hidden .env settings\n'
+printf '  cd %s && docker compose logs -f --tail=100 gods-eye-view\n' "$APP_ROOT"
 
-printf 'Advanced Google: GOOGLE_MAPS_SERVER_API_KEY is hidden by upstream; GOOGLE_MAPS_API_KEY falls back for those server calls, or use edit-gods-eye-view-keys for a separate server-only key\n'
-
-printf 'API/config file: %s/.env\n' \
-  "$SRC_DIR"
-
-printf 'Edit advanced:   edit-gods-eye-view-keys\n'
-printf 'Provider doctor: doctor-gods-eye-view\n'
-printf 'Restart:         restart-gods-eye-view\n'
-printf 'Update upstream: update-gods-eye-view\n'
-
-printf \
-  'Logs:            cd %s && docker compose logs -f --tail=100 gods-eye-view\n\n' \
-  "$APP_ROOT"
-
-printf 'Important:\n'
-
-printf \
-  '  • GOOGLE_MAPS_API_KEY, CESIUM_ION_TOKEN and MAPILLARY_CLIENT_TOKEN are browser-exposed by GEV design; restrict them to your HTTPS domain/provider scopes.\n'
-
-printf \
-  '  • For a separate GOOGLE_MAPS_SERVER_API_KEY, restrict it to the VPS egress IP address(es) and only the required Google APIs.\n'
-
-printf \
-  '  • Remote /mcp remains untouched/disabled by this adapter.\n'
-
-printf \
-  '  • Operator-specific settings such as LOCAL_RECEIVER_FEEDS and OVERPASS_UPSTREAMS still require infrastructure/URLs you supply separately.\n\n'
+printf '\n'
+printf 'Notes:\n'
+printf '  • GOOGLE_MAPS_SERVER_API_KEY is hidden by upstream POWER UP; use edit-gods-eye-view-keys if you want a separate server-only Google key.\n'
+printf '  • GOOGLE_MAPS_API_KEY, CESIUM_ION_TOKEN and MAPILLARY_CLIENT_TOKEN are browser-exposed by current GEV design; restrict them at the provider to this HTTPS hostname / required scopes.\n'
+printf '  • Remote /mcp is intentionally NOT adapted; upstream keeps it direct-local-only.\n'
+printf '  • This installer is fresh-install only and is audited for GEV %s.\n\n' "$EXPECTED_GEV_VERSION"
