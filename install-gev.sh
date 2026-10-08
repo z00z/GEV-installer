@@ -957,6 +957,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
        bash \
        nginx \
+       git \
        ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p \
@@ -1095,7 +1096,8 @@ ${NETWORK_LABEL_BLOCK}
 
   gev-maintenance:
 
-    image: ${NODE_IMAGE}
+    image: ${RUNTIME_IMAGE}
+    entrypoint: []
     user: "${APP_UID}:${APP_GID}"
     working_dir: /app
 
@@ -1155,8 +1157,14 @@ fi
 say "Building the local runtime image"
 docker compose build --pull gods-eye-view
 
-say "Pulling the Node maintenance image"
-docker compose pull gev-maintenance
+say "Using the locally built runtime image for maintenance/tests"
+
+say "Verifying Git inside the maintenance/runtime image"
+docker compose run \
+  --rm \
+  --no-deps \
+  gev-maintenance \
+  git --version
 
 say "Verifying the Node runtime version"
 
